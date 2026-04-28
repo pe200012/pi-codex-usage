@@ -1,3 +1,11 @@
+/**
+ * pi extension that renders Codex usage windows in the footer.
+ *
+ * pi invalidates ExtensionContext objects when sessions are replaced or
+ * reloaded. This module keeps background refresh timers session-scoped and
+ * guards all delayed UI work with lifecycle tokens before touching ctx.
+ */
+
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -32,6 +40,9 @@ type UsageSnapshot = {
 type PercentDisplayMode = "left" | "used";
 type ResetWindowMode = "5h" | "7d";
 
+type ExtensionUi = ExtensionContext["ui"];
+type UiNotificationLevel = "info" | "warning" | "error";
+
 type ExtensionPreferences = {
 	usageMode: PercentDisplayMode;
 	refreshWindow: ResetWindowMode;
@@ -60,6 +71,49 @@ const UNKNOWN_PERCENT = "--";
 
 const MISSING_AUTH_ERROR_PREFIX = "Missing openai-codex OAuth access/accountId";
 
+function isStaleExtensionContextError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	return error.message.includes("extension ctx is stale") || error.message.includes("extension instance is stale");
+}
+
+function getContextUi(ctx: ExtensionContext): ExtensionUi | undefined {
+	try {
+		if (!ctx.hasUI) return undefined;
+		return ctx.ui;
+	} catch (error) {
+		if (isStaleExtensionContextError(error)) return undefined;
+		throw error;
+	}
+}
+
+function getContextModelId(ctx: ExtensionContext): string | undefined {
+	try {
+		return ctx.model?.id;
+	} catch (error) {
+		if (isStaleExtensionContextError(error)) return undefined;
+		throw error;
+	}
+}
+
+function withContextUi<T>(ctx: ExtensionContext, operation: (ui: ExtensionUi) => T): T | undefined {
+	const ui = getContextUi(ctx);
+	if (!ui) return undefined;
+	try {
+		return operation(ui);
+	} catch (error) {
+		if (isStaleExtensionContextError(error)) return undefined;
+		throw error;
+	}
+}
+
+function setStatusIfAvailable(ctx: ExtensionContext, value: string | undefined): void {
+	withContextUi(ctx, (ui) => ui.setStatus(EXTENSION_ID, value));
+}
+
+function notifyIfAvailable(ctx: ExtensionContext, message: string, level: UiNotificationLevel): void {
+	withContextUi(ctx, (ui) => ui.notify(message, level));
+}
+
 function clampPercent(value: number): number {
 	return Math.min(100, Math.max(0, value));
 }
@@ -75,7 +129,7 @@ function leftToUsedPercent(value: number | null | undefined): number | null {
 }
 
 function colorizePercent(
-	theme: ExtensionContext["ui"]["theme"],
+	theme: ExtensionUi["theme"],
 	valueLeft: number | null,
 	mode: PercentDisplayMode,
 ): string {
@@ -120,13 +174,12 @@ function getStatusLabel(modelId: string | undefined): string {
 }
 
 function formatStatus(
-	ctx: ExtensionContext,
+	theme: ExtensionUi["theme"],
 	usage: UsageSnapshot,
 	mode: PercentDisplayMode,
 	resetWindowMode: ResetWindowMode,
 	modelId: string | undefined,
 ): string {
-	const theme = ctx.ui.theme;
 	const label = getStatusLabel(modelId);
 	const title = usage.isLimited ? theme.fg("error", label) : theme.fg("dim", label);
 	const fiveHourText = colorizePercent(theme, usage.fiveHourLeftPercent, mode);
@@ -377,81 +430,125 @@ function isMissingCodexAuthError(error: unknown): boolean {
 }
 
 function createStatusRefresher() {
+	type RefreshRequest = {
+		ctx: ExtensionContext;
+		modelId: string | undefined;
+		token: number;
+	};
+
 	let refreshTimer: ReturnType<typeof setInterval> | undefined;
-	let activeContext: ExtensionContext | undefined;
+	let activeContext: RefreshRequest | undefined;
 	let isRefreshInFlight = false;
-	let queuedRefresh: { ctx: ExtensionContext; modelId: string | undefined } | null = null;
+	let queuedRefresh: RefreshRequest | null = null;
 	let percentDisplayMode: PercentDisplayMode = DEFAULT_PERCENT_DISPLAY_MODE;
 	let resetWindowMode: ResetWindowMode = DEFAULT_RESET_WINDOW_MODE;
 	let lastUsageSnapshot: UsageSnapshot | undefined;
+	let refreshToken = 0;
+	let isActive = false;
 
-	async function updateFooterStatus(ctx: ExtensionContext, modelId = ctx.model?.id): Promise<void> {
-		if (!ctx.hasUI) return;
+	function isCurrent(token: number): boolean {
+		return isActive && token === refreshToken;
+	}
+
+	function observeBackgroundRefresh(promise: Promise<void>): void {
+		void promise.catch((error) => {
+			if (isStaleExtensionContextError(error)) return;
+			console.warn(`pi-codex-usage: background refresh failed: ${formatErrorMessage(error)}`);
+		});
+	}
+
+	async function updateFooterStatus(ctx: ExtensionContext, modelId: string | undefined, token: number): Promise<void> {
+		if (!isCurrent(token) || !getContextUi(ctx)) return;
 		if (isRefreshInFlight) {
-			queuedRefresh = { ctx, modelId };
+			queuedRefresh = { ctx, modelId, token };
 			return;
 		}
 		isRefreshInFlight = true;
 		try {
 			const usage = parseUsageSnapshot(await requestUsageJson(), modelId);
+			if (!isCurrent(token)) return;
+
 			lastUsageSnapshot = usage;
-			ctx.ui.setStatus(EXTENSION_ID, formatStatus(ctx, usage, percentDisplayMode, resetWindowMode, modelId));
+			withContextUi(ctx, (ui) => {
+				ui.setStatus(EXTENSION_ID, formatStatus(ui.theme, usage, percentDisplayMode, resetWindowMode, modelId));
+			});
 		} catch (error) {
+			if (!isCurrent(token) || isStaleExtensionContextError(error)) return;
 			if (isMissingCodexAuthError(error)) {
 				lastUsageSnapshot = undefined;
-				ctx.ui.setStatus(EXTENSION_ID, undefined);
+				setStatusIfAvailable(ctx, undefined);
 				return;
 			}
 
-			const theme = ctx.ui.theme;
-			const unavailableStatus = `${getStatusLabel(modelId)} unavailable`;
-			ctx.ui.setStatus(EXTENSION_ID, theme.fg("warning", unavailableStatus));
+			withContextUi(ctx, (ui) => {
+				const unavailableStatus = `${getStatusLabel(modelId)} unavailable`;
+				ui.setStatus(EXTENSION_ID, ui.theme.fg("warning", unavailableStatus));
+			});
 		} finally {
 			isRefreshInFlight = false;
-			if (queuedRefresh) {
-				const nextRefresh = queuedRefresh;
-				queuedRefresh = null;
-				void updateFooterStatus(nextRefresh.ctx, nextRefresh.modelId);
+			const nextRefresh = queuedRefresh;
+			queuedRefresh = null;
+			if (nextRefresh && isCurrent(nextRefresh.token)) {
+				observeBackgroundRefresh(updateFooterStatus(nextRefresh.ctx, nextRefresh.modelId, nextRefresh.token));
 			}
 		}
 	}
 
-	function refreshFor(ctx: ExtensionContext, modelId = ctx.model?.id): Promise<void> {
-		activeContext = ctx;
-		return updateFooterStatus(ctx, modelId);
+	function refreshFor(ctx: ExtensionContext, modelId?: string, token = refreshToken): Promise<void> {
+		if (!isCurrent(token)) return Promise.resolve();
+		const resolvedModelId = modelId ?? getContextModelId(ctx);
+		if (!isCurrent(token)) return Promise.resolve();
+		activeContext = { ctx, modelId: resolvedModelId, token };
+		return updateFooterStatus(ctx, resolvedModelId, token);
 	}
 
-	function startAutoRefresh(): void {
+	function startAutoRefresh(): number {
+		refreshToken += 1;
+		isActive = true;
+		activeContext = undefined;
+		queuedRefresh = null;
 		if (refreshTimer) clearInterval(refreshTimer);
+
+		const timerToken = refreshToken;
 		refreshTimer = setInterval(() => {
-			if (!activeContext) return;
-			void updateFooterStatus(activeContext);
+			const currentContext = activeContext;
+			if (!currentContext || currentContext.token !== timerToken || !isCurrent(currentContext.token)) return;
+			observeBackgroundRefresh(updateFooterStatus(currentContext.ctx, currentContext.modelId, currentContext.token));
 		}, REFRESH_INTERVAL_MS);
 		refreshTimer.unref?.();
+		return timerToken;
 	}
 
 	function stopAutoRefresh(ctx?: ExtensionContext): void {
+		isActive = false;
+		refreshToken += 1;
+		activeContext = undefined;
+		queuedRefresh = null;
 		if (refreshTimer) {
 			clearInterval(refreshTimer);
 			refreshTimer = undefined;
 		}
-		ctx?.ui.setStatus(EXTENSION_ID, undefined);
+		if (ctx) setStatusIfAvailable(ctx, undefined);
 	}
 
-	async function setLoadingStatus(ctx: ExtensionContext): Promise<void> {
-		if (!ctx.hasUI) return;
+	async function setLoadingStatus(ctx: ExtensionContext, token = refreshToken): Promise<void> {
+		if (!isCurrent(token)) return;
 
 		try {
 			await loadAuthCredentials();
 		} catch (error) {
+			if (!isCurrent(token)) return;
 			if (isMissingCodexAuthError(error)) {
-				ctx.ui.setStatus(EXTENSION_ID, undefined);
+				setStatusIfAvailable(ctx, undefined);
 				return;
 			}
 		}
 
-		const loadingStatus = `${getStatusLabel(ctx.model?.id)} loading...`;
-		ctx.ui.setStatus(EXTENSION_ID, ctx.ui.theme.fg("dim", loadingStatus));
+		if (!isCurrent(token)) return;
+		withContextUi(ctx, (ui) => {
+			const loadingStatus = `${getStatusLabel(getContextModelId(ctx))} loading...`;
+			ui.setStatus(EXTENSION_ID, ui.theme.fg("dim", loadingStatus));
+		});
 	}
 
 	function setPercentDisplayMode(mode: PercentDisplayMode): void {
@@ -471,9 +568,16 @@ function createStatusRefresher() {
 	}
 
 	function renderFromLastSnapshot(ctx: ExtensionContext): boolean {
-		if (!ctx.hasUI || !lastUsageSnapshot) return false;
-		ctx.ui.setStatus(EXTENSION_ID, formatStatus(ctx, lastUsageSnapshot, percentDisplayMode, resetWindowMode, ctx.model?.id));
-		return true;
+		if (!lastUsageSnapshot) return false;
+		return (
+			withContextUi(ctx, (ui) => {
+				ui.setStatus(
+					EXTENSION_ID,
+					formatStatus(ui.theme, lastUsageSnapshot, percentDisplayMode, resetWindowMode, getContextModelId(ctx)),
+				);
+				return true;
+			}) === true
+		);
 	}
 
 	return {
@@ -486,6 +590,7 @@ function createStatusRefresher() {
 		setResetWindowMode,
 		getResetWindowMode,
 		renderFromLastSnapshot,
+		isCurrent,
 	};
 }
 
@@ -498,6 +603,7 @@ export default function (pi: ExtensionAPI) {
 	const refresher = createStatusRefresher();
 	let settingsWriteQueue: Promise<void> = Promise.resolve();
 	let applyingPersistedPreferences = false;
+	let applyingPersistedPreferencesToken: number | undefined;
 	let modeChangedDuringStartupLoad = false;
 	let windowChangedDuringStartupLoad = false;
 
@@ -512,54 +618,65 @@ export default function (pi: ExtensionAPI) {
 			.then(() => persistPreferences(preferences));
 
 		void settingsWriteQueue.catch((error) => {
-			if (!ctx.hasUI) return;
-			ctx.ui.notify(
+			notifyIfAvailable(
+				ctx,
 				`pi-codex-usage: failed to write ${SETTINGS_FILE}: ${formatErrorMessage(error)}`,
 				"warning",
 			);
 		});
 	}
 
-	async function applyPersistedPreferences(ctx: ExtensionContext): Promise<void> {
+	async function applyPersistedPreferences(ctx: ExtensionContext, token: number): Promise<void> {
 		applyingPersistedPreferences = true;
+		applyingPersistedPreferencesToken = token;
 		try {
 			const { preferences, needsWrite } = await loadPersistedPreferences();
+			if (!refresher.isCurrent(token)) return;
 			if (!modeChangedDuringStartupLoad) {
 				refresher.setPercentDisplayMode(preferences.usageMode);
 			}
 			if (!windowChangedDuringStartupLoad) {
 				refresher.setResetWindowMode(preferences.refreshWindow);
 			}
-			if (needsWrite) {
+			if (needsWrite && refresher.isCurrent(token)) {
 				queuePersistCurrentPreferences(ctx);
 			}
 		} catch (error) {
+			if (!refresher.isCurrent(token)) return;
 			if (!modeChangedDuringStartupLoad) {
 				refresher.setPercentDisplayMode(DEFAULT_PERCENT_DISPLAY_MODE);
 			}
 			if (!windowChangedDuringStartupLoad) {
 				refresher.setResetWindowMode(DEFAULT_RESET_WINDOW_MODE);
 			}
-			if (!ctx.hasUI) return;
-
-			ctx.ui.notify(
+			if (!refresher.isCurrent(token)) return;
+			notifyIfAvailable(
+				ctx,
 				`pi-codex-usage: failed to load ${SETTINGS_FILE}, using defaults (${DEFAULT_PERCENT_DISPLAY_MODE}, ${DEFAULT_RESET_WINDOW_MODE}): ${formatErrorMessage(error)}`,
 				"warning",
 			);
 		} finally {
-			applyingPersistedPreferences = false;
-			modeChangedDuringStartupLoad = false;
-			windowChangedDuringStartupLoad = false;
+			if (applyingPersistedPreferencesToken === token) {
+				applyingPersistedPreferences = false;
+				applyingPersistedPreferencesToken = undefined;
+				modeChangedDuringStartupLoad = false;
+				windowChangedDuringStartupLoad = false;
+			}
 		}
 	}
 
 	pi.on("session_start", (_event, ctx) => {
-		refresher.startAutoRefresh();
+		const token = refresher.startAutoRefresh();
 		void (async () => {
-			await applyPersistedPreferences(ctx);
-			await refresher.setLoadingStatus(ctx);
-			await refresher.refreshFor(ctx);
-		})();
+			await applyPersistedPreferences(ctx, token);
+			if (!refresher.isCurrent(token)) return;
+			await refresher.setLoadingStatus(ctx, token);
+			if (!refresher.isCurrent(token)) return;
+			await refresher.refreshFor(ctx, undefined, token);
+		})().catch((error) => {
+			if (isStaleExtensionContextError(error) || !refresher.isCurrent(token)) return;
+			notifyIfAvailable(ctx, `pi-codex-usage: startup refresh failed: ${formatErrorMessage(error)}`, "warning");
+		});
 	});
 
 	pi.on("turn_end", (_event, ctx) => {
