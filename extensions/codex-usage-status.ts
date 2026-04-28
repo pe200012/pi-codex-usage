@@ -1,3 +1,11 @@
+/**
+ * pi extension that renders Codex usage windows in the footer.
+ *
+ * pi invalidates ExtensionContext objects when sessions are replaced or reloaded.
+ * This module keeps background refresh work session-scoped and guards delayed UI
+ * access with lifecycle generations before touching ctx.
+ */
+
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { completions, parseChoice, preferenceCommands, type PreferenceCommand } from "../src/codex-usage/commands";
 import { formatStatus, unavailableStatus } from "../src/codex-usage/format";
@@ -7,6 +15,61 @@ import { getUsage, MISSING_AUTH_ERROR } from "../src/codex-usage/usage";
 
 const EXTENSION_ID = "codex-usage";
 const REFRESH_INTERVAL_MS = 60_000;
+
+type ExtensionUi = ExtensionContext["ui"];
+type UiNotificationLevel = "info" | "warning" | "error";
+
+function isStaleExtensionContextError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const message = error.message.toLowerCase();
+	return message.includes("extension ctx is stale") || message.includes("extension instance is stale");
+}
+
+function getContextUi(ctx: ExtensionContext): ExtensionUi | undefined {
+	try {
+		if (!ctx.hasUI) return undefined;
+		return ctx.ui;
+	} catch (error) {
+		if (isStaleExtensionContextError(error)) return undefined;
+		throw error;
+	}
+}
+
+function getContextModelId(ctx: ExtensionContext): string | undefined {
+	try {
+		return ctx.model?.id;
+	} catch (error) {
+		if (isStaleExtensionContextError(error)) return undefined;
+		throw error;
+	}
+}
+
+function withContextUi<T>(ctx: ExtensionContext, operation: (ui: ExtensionUi) => T): T | undefined {
+	const ui = getContextUi(ctx);
+	if (!ui) return undefined;
+	try {
+		return operation(ui);
+	} catch (error) {
+		if (isStaleExtensionContextError(error)) return undefined;
+		throw error;
+	}
+}
+
+function setStatusIfAvailable(ctx: ExtensionContext, value: string | undefined): void {
+	withContextUi(ctx, (ui) => ui.setStatus(EXTENSION_ID, value));
+}
+
+function notifyIfAvailable(ctx: ExtensionContext, message: string, level: UiNotificationLevel): void {
+	withContextUi(ctx, (ui) => ui.notify(message, level));
+}
+
+function formatStatusWithUi(ui: ExtensionUi, usage: UsageSnapshot, preferences: Preferences, modelId: string | undefined): string {
+	return formatStatus({ ui } as ExtensionContext, usage, preferences, modelId);
+}
+
+function unavailableStatusWithUi(ui: ExtensionUi, modelId: string | undefined): string {
+	return unavailableStatus({ ui } as ExtensionContext, modelId);
+}
 
 class CodexUsageStatus {
 	private ctx?: ExtensionContext;
@@ -21,8 +84,8 @@ class CodexUsageStatus {
 
 	public constructor(private readonly pi: ExtensionAPI) {
 		pi.on("session_start", (_event, ctx) => this.start(ctx));
-		pi.on("turn_end", (_event, ctx) => void this.refresh(ctx));
-		pi.on("model_select", (event, ctx) => void this.refresh(ctx, event.model.id));
+		pi.on("turn_end", (_event, ctx) => this.observeBackgroundRefresh(this.refresh(ctx)));
+		pi.on("model_select", (event, ctx) => this.observeBackgroundRefresh(this.refresh(ctx, event.model.id)));
 		pi.on("session_shutdown", (_event, ctx) => this.stop(ctx));
 
 		for (const command of preferenceCommands) this.registerPreferenceCommand(command);
@@ -32,18 +95,29 @@ class CodexUsageStatus {
 		return this.ctx !== undefined && this.generation === generation;
 	}
 
+	private observeBackgroundRefresh(promise: Promise<void>): void {
+		void promise.catch((error) => {
+			if (isStaleExtensionContextError(error)) return;
+			console.warn(`pi-codex-usage: background refresh failed: ${errorMessage(error)}`);
+		});
+	}
+
 	private start(ctx: ExtensionContext): void {
 		this.generation++;
 		this.ctx = ctx;
 		if (this.timer) clearInterval(this.timer);
-		this.timer = setInterval(() => void this.refresh(), REFRESH_INTERVAL_MS);
-		this.timer.unref?.();
 
 		const generation = this.generation;
+		this.timer = setInterval(() => this.observeBackgroundRefresh(this.refresh(undefined, undefined, generation)), REFRESH_INTERVAL_MS);
+		this.timer.unref?.();
+
 		void (async () => {
 			await this.loadPreferences(ctx, generation);
-			await this.refresh(ctx, ctx.model?.id, generation);
-		})();
+			await this.refresh(ctx, getContextModelId(ctx), generation);
+		})().catch((error) => {
+			if (!this.isCurrent(generation) || isStaleExtensionContextError(error)) return;
+			notifyIfAvailable(ctx, `pi-codex-usage: startup refresh failed: ${errorMessage(error)}`, "warning");
+		});
 	}
 
 	private stop(ctx: ExtensionContext): void {
@@ -52,7 +126,7 @@ class CodexUsageStatus {
 		this.queued = undefined;
 		this.ctx = undefined;
 		this.generation++;
-		if (ctx.hasUI) ctx.ui.setStatus(EXTENSION_ID, undefined);
+		setStatusIfAvailable(ctx, undefined);
 	}
 
 	private enqueuePreferenceOperation<T>(operation: () => Promise<T>): Promise<T> {
@@ -70,47 +144,50 @@ class CodexUsageStatus {
 			if (!this.isCurrent(generation)) return;
 			const changedDuringLoad = this.preferenceRevision !== revision;
 			if (!changedDuringLoad) this.preferences = { ...DEFAULT_PREFERENCES };
-			if (ctx.hasUI) {
-				const action = changedDuringLoad ? "keeping current preferences" : "using defaults";
-				ctx.ui.notify(`pi-codex-usage: failed to load ${SETTINGS_FILE}, ${action}: ${errorMessage(error)}`, "warning");
-			}
+			const action = changedDuringLoad ? "keeping current preferences" : "using defaults";
+			notifyIfAvailable(ctx, `pi-codex-usage: failed to load ${SETTINGS_FILE}, ${action}: ${errorMessage(error)}`, "warning");
 		}
 	}
 
-	private async refresh(ctx = this.ctx, modelId = ctx?.model?.id, generation = this.generation): Promise<void> {
-		if (!ctx?.hasUI || !this.isCurrent(generation)) return;
+	private async refresh(ctx = this.ctx, modelId?: string, generation = this.generation): Promise<void> {
+		if (!ctx || !this.isCurrent(generation) || !getContextUi(ctx)) return;
+		const resolvedModelId = modelId ?? getContextModelId(ctx);
+		if (!this.isCurrent(generation)) return;
 
 		if (this.inFlight) {
-			this.queued = { ctx, generation, modelId };
+			this.queued = { ctx, generation, modelId: resolvedModelId };
 			return;
 		}
 
 		this.inFlight = true;
 		try {
-			const usage = await getUsage(modelId);
+			const usage = await getUsage(resolvedModelId);
 			if (!this.isCurrent(generation)) return;
 			this.lastUsage = usage;
-			ctx.ui.setStatus(EXTENSION_ID, formatStatus(ctx, usage, this.preferences, modelId));
+			withContextUi(ctx, (ui) => ui.setStatus(EXTENSION_ID, formatStatusWithUi(ui, usage, this.preferences, resolvedModelId)));
 		} catch (error) {
-			if (!this.isCurrent(generation)) return;
+			if (!this.isCurrent(generation) || isStaleExtensionContextError(error)) return;
 			if (errorMessage(error).includes(MISSING_AUTH_ERROR)) {
 				this.lastUsage = undefined;
-				ctx.ui.setStatus(EXTENSION_ID, undefined);
+				setStatusIfAvailable(ctx, undefined);
 			} else {
-				ctx.ui.setStatus(EXTENSION_ID, unavailableStatus(ctx, modelId));
+				withContextUi(ctx, (ui) => ui.setStatus(EXTENSION_ID, unavailableStatusWithUi(ui, resolvedModelId)));
 			}
 		} finally {
 			this.inFlight = false;
 			const queued = this.queued;
 			this.queued = undefined;
-			if (queued && this.isCurrent(queued.generation)) void this.refresh(queued.ctx, queued.modelId, queued.generation);
+			if (queued && this.isCurrent(queued.generation)) this.observeBackgroundRefresh(this.refresh(queued.ctx, queued.modelId, queued.generation));
 		}
 	}
 
 	private renderLast(ctx: ExtensionContext): boolean {
-		if (!ctx.hasUI || !this.lastUsage) return false;
-		ctx.ui.setStatus(EXTENSION_ID, formatStatus(ctx, this.lastUsage, this.preferences, ctx.model?.id));
-		return true;
+		if (!this.lastUsage) return false;
+		const modelId = getContextModelId(ctx);
+		return withContextUi(ctx, (ui) => {
+			ui.setStatus(EXTENSION_ID, formatStatusWithUi(ui, this.lastUsage as UsageSnapshot, this.preferences, modelId));
+			return true;
+		}) ?? false;
 	}
 
 	private savePreferences(ctx: ExtensionContext, generation = this.generation): void {
@@ -118,8 +195,8 @@ class CodexUsageStatus {
 		const result = this.enqueuePreferenceOperation(() => savePreferences(preferences));
 		void result.catch(error => {
 			const notifyContext = this.ctx ?? ctx;
-			if (this.isCurrent(generation) && notifyContext.hasUI) {
-				notifyContext.ui.notify(`pi-codex-usage: failed to write ${SETTINGS_FILE}: ${errorMessage(error)}`, "warning");
+			if (this.isCurrent(generation)) {
+				notifyIfAvailable(notifyContext, `pi-codex-usage: failed to write ${SETTINGS_FILE}: ${errorMessage(error)}`, "warning");
 			}
 		});
 	}
